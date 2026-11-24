@@ -4,8 +4,11 @@
   - 上传/校验逐分钟模型分数 CSV（≤3000 行、分钟号连续、整数分数）
   - 录入告警阈值、有效提前量上限 U、至少命中次数 K、卡纸可能区间（≤20 段，
     每段≤10 个分钟号、互不重叠）
-  - 调用 core.solve 核定最大可承诺提前量 L，并给出反例组合与最佳配对
-  - 区间/参数/数据一经更正，旧结论立即撤下（历史区可见）
+  - 分轮调用 core.min_hits / core.counterexample 核定最大可承诺提前量 L：
+    每次提交（/analyze）或继续（/continue）至多做 ROUND_BUDGET 次单档最坏
+    命中计算（反例求解同样占预算），同一次核定缓存各档结果不重算
+  - 未完成时给出“已证实可承诺的最大档 / 不能承诺的最小档”双侧边界
+  - 区间/参数/数据一经更正，旧结论立即撤下（历史区可见），旧进度作废
 """
 import csv
 import io
@@ -15,8 +18,9 @@ import re
 import time
 import uuid
 from datetime import datetime
+from threading import Lock
 
-from flask import (Flask, Response, flash, redirect, render_template,
+from flask import (Flask, Response, flash, jsonify, redirect, render_template,
                    request, session, url_for)
 
 import core
@@ -26,6 +30,7 @@ MAX_ROWS = 3000          # CSV 最多行数
 MAX_JAMS = 20            # 卡纸区间最多段数
 MAX_SPAN = 9             # 每段区间至多含 10 个分钟号 => b-a <= 9
 MAX_HISTORY = 20
+ROUND_BUDGET = 2         # 每次提交/继续最多做两次单档最坏命中计算
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-key")
@@ -41,8 +46,11 @@ def get_store():
     if not sid:
         sid = uuid.uuid4().hex
         session["sid"] = sid
-    return STORE.setdefault(sid, {"data": None, "current": None,
-                                  "history": [], "seq": 0})
+    store = STORE.setdefault(sid, {"data": None, "current": None, "job": None,
+                                   "history": [], "seq": 0, "lock": Lock()})
+    store.setdefault("job", None)
+    store.setdefault("lock", Lock())
+    return store
 
 
 def now_str():
@@ -58,6 +66,230 @@ def withdraw_current(store, reason):
         store["history"].insert(0, cur)
         store["history"] = store["history"][:MAX_HISTORY]
         store["current"] = None
+
+
+def invalidate_job(store):
+    """作废分轮核定进度（阶段结果不进历史，直接丢弃）。"""
+    job = store.get("job")
+    if job:
+        job["status"] = "void"
+    store["job"] = None
+
+
+# ---------------------------------------------------------------- 分轮核定
+
+def recompute_bounds(job):
+    """从已算完档位重建双侧边界。
+
+    返回 (ok, bad)：ok=已证实可行（命中≥K）的最大档，没有时为 0（虚拟地板）；
+    bad=已证实不可行（命中<K）的最小档，没有时为 U+1（虚拟天花板）。
+    页面展示时 0 与 U+1 均视为“缺证据的一端：待核定”。
+    """
+    U, K = int(job["U"]), int(job["K"])
+    ok, bad = 0, U + 1
+    for key, hits in job["values"].items():
+        L, hits = int(key), int(hits)
+        if hits >= K:
+            ok = max(ok, L)
+        else:
+            bad = min(bad, L)
+    job["best_ok"] = ok if ok >= 1 else None
+    job["bad_min"] = bad if bad <= U else None
+    # 注意：模板里 job.values 会命中 dict.values 方法，故直接给出对应命中数
+    job["best_ok_hits"] = job["values"].get(str(ok)) if ok >= 1 else None
+    job["bad_min_hits"] = job["values"].get(str(bad)) if bad <= U else None
+    return ok, bad
+
+
+def tier_rows(job):
+    """供页面渲染的已算档位明细（按 L 升序）。"""
+    K = int(job["K"])
+    rows = []
+    for key in sorted(job["values"], key=lambda x: int(x)):
+        L = int(key)
+        hits = int(job["values"][key])
+        rows.append({"L": L, "hits": hits,
+                     "verdict": "可承诺" if hits >= K else "不能承诺"})
+    return rows
+
+
+def _publish_result(store, job, counter):
+    """搜索收口后按 core.solve 的原规则组装最终结论并置为当前有效结论。"""
+    U, K = int(job["U"]), int(job["K"])
+    ok, bad = recompute_bounds(job)
+    intervals = job["intervals"]
+    alerts = job["alerts"]
+    out = {
+        "m": len(intervals), "U": U, "K": K,
+        "n_alerts": len(alerts), "intervals": intervals,
+        "alerts": alerts,
+        "rounds": job["round_no"] + 1,
+        "calcs": job["calcs"],
+        "elapsed_ms": round(job["calc_ms"], 1),
+        "tiers": tier_rows(job),
+    }
+    if bad == 1:  # L=1 档已证实不达标 => 无法承诺
+        out.update(status="infeasible",
+                   reason="no_alerts" if not alerts else "L1",
+                   min_hits_1=int(job["values"]["1"]),
+                   counter=counter)
+    else:
+        Lstar = ok
+        out.update(status="ok", L=Lstar,
+                   min_hits=int(job["values"][str(Lstar)]))
+        if counter is not None:
+            out["counter"] = counter
+    job["result"] = out
+    job["status"] = "done"
+    job["pending_counter"] = None
+    store["current"] = {
+        "id": store["seq"], "job_id": job["id"], "time": now_str(),
+        "status": "有效", "params": job["params"],
+        "data_name": job["data_name"], "data_rows": job["data_rows"],
+        "result": out,
+    }
+
+
+def execute_round(store, job):
+    """推进一轮：至多 ROUND_BUDGET 次单档最坏命中计算（含反例求解）。
+
+    已算完的档位缓存在 job['values'] / job['counters'] 中，绝不重算。
+    任何计算异常都会被保留为 job['last_error']，此前已算完的档位原样保留，
+    job 状态置为 'failed'，下一次同版本继续可重试未完成的那一档。
+    """
+    budget = ROUND_BUDGET
+    used = 0
+    job["last_error"] = None
+    if job.get("status") != "done":
+        job["status"] = "running"
+    job["pending_counter"] = None
+
+    def count_call():
+        nonlocal used
+        used += 1
+        job["round_calcs"] = used
+        job["calcs"] += 1
+
+    def call_min_hits(L):
+        count_call()
+        t0 = time.perf_counter()
+        try:
+            hits = core.min_hits(L, job["alerts"], job["intervals"], job["U"])
+        finally:
+            job["calc_ms"] += (time.perf_counter() - t0) * 1000
+        job["values"][str(L)] = int(hits)
+        return int(hits)
+
+    def call_counter(L):
+        count_call()
+        t0 = time.perf_counter()
+        try:
+            combo, pairs = core.counterexample(
+                L, job["alerts"], job["intervals"], job["U"])
+            cd = core.format_counter(L, combo, pairs, job["intervals"])
+        finally:
+            job["calc_ms"] += (time.perf_counter() - t0) * 1000
+        job["counters"][str(L)] = cd
+        return cd
+
+    try:
+        while True:
+            ok, bad = recompute_bounds(job)
+            if bad - ok <= 1:
+                # 二分括号收口：bad=ok+1。bad<=U 时按原规则需要 bad 档反例。
+                if bad <= int(job["U"]):
+                    cd = job["counters"].get(str(bad))
+                    if cd is None:
+                        if used >= budget:
+                            # 本轮两次额度已用完（例如第二次探测刚好收口），
+                            # 反例求解留到下一轮，且仍只占下一轮 1 次额度。
+                            job["status"] = "running"
+                            job["pending_counter"] = bad
+                            job["round_calcs"] = used
+                            return job
+                        cd = call_counter(bad)
+                    _publish_result(store, job, cd)
+                else:
+                    # bad == U+1 虚拟天花板且与 ok 相邻 => L*=ok=U，无需反例。
+                    _publish_result(store, job, None)
+                job["round_calcs"] = used
+                return job
+
+            # 括号未收口。额度用尽则收尾展示双侧边界，等下一次“继续”。
+            if used >= budget:
+                job["status"] = "running"
+                job["round_calcs"] = used
+                return job
+
+            # 先核定 L=1：最快回答“能否承诺任何处置时间”，也与原 solve 顺序一致；
+            # 之后在 (ok, bad) 中取中点做标准二分探测。
+            if "1" not in job["values"]:
+                L = 1
+            else:
+                L = (ok + bad) // 2
+            if str(L) in job["values"]:  # 理论不可达的保护，避免死循环
+                L = next((x for x in range(ok + 1, bad)
+                          if str(x) not in job["values"]), None)
+                if L is None:
+                    job["status"] = "running"
+                    job["round_calcs"] = used
+                    return job
+            call_min_hits(L)
+    except Exception as exc:  # 求解失败：保留已算完档位，允许同版本重试
+        job["status"] = "failed"
+        job["last_error"] = f"{type(exc).__name__}: {exc}"
+        job["round_calcs"] = used
+        return job
+
+
+def proceed(store, job):
+    """执行一轮并做版本/轮次记账。失败时 rev 不前进，便于用同一表单重试。"""
+    rev_before = int(job.get("rev", 0))
+    execute_round(store, job)
+    if job.get("status") != "failed":
+        job["rev"] = rev_before + 1
+        job["round_no"] = int(job.get("round_no", 0)) + 1
+    job["updated_at"] = now_str()
+    return job
+
+
+def start_review(store, params):
+    """校验通过后发起一次新核定并立即执行第 1 轮（≤2 次计算）。"""
+    store["seq"] += 1
+    data = store["data"]
+    alerts = core.compute_alerts(data["minutes"], data["scores"],
+                                 params["threshold"])
+    job = {
+        "id": uuid.uuid4().hex[:12], "seq": store["seq"],
+        "rev": 0, "round_no": 0, "status": "running",
+        "created_at": now_str(), "updated_at": now_str(),
+        "params": params,
+        "threshold": params["threshold"], "U": params["U"], "K": params["K"],
+        "intervals": params["intervals"], "alerts": alerts,
+        "data_name": data["name"], "data_rows": len(data["minutes"]),
+        "values": {}, "counters": {},
+        "best_ok": None, "bad_min": None,
+        "best_ok_hits": None, "bad_min_hits": None,
+        "calcs": 0, "round_calcs": 0, "calc_ms": 0.0,
+        "pending_counter": None, "last_error": None, "result": None,
+    }
+    store["job"] = job
+    proceed(store, job)
+    return job
+
+
+def req_field(names):
+    """从表单/查询串/JSON 中按候选名取字段（兼容不同调用习惯）。"""
+    for name in names:
+        v = request.values.get(name)
+        if v is not None and str(v) != "":
+            return v
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        for name in names:
+            if body.get(name) is not None:
+                return body.get(name)
+    return None
 
 
 def _to_int(s):
@@ -256,10 +488,17 @@ def index():
     store = get_store()
     data = store.get("data")
     current = store.get("current")
+    job = store.get("job")
     svg = geom = replay = None
     if data:
-        p = current["params"] if current else {}
-        r = current["result"] if current else {}
+        if current:
+            p = current["params"]
+            r = current["result"]
+        elif job:
+            p = job["params"]
+            r = {"alerts": job.get("alerts", [])}
+        else:
+            p, r = {}, {}
         counter = r.get("counter") or {}
         svg, geom = build_svg(
             data["minutes"], data["scores"],
@@ -271,13 +510,43 @@ def index():
         replay = json.dumps({
             "minutes": data["minutes"], "scores": data["scores"],
             "alerts": r.get("alerts", []), "geom": geom})
-    form = current["params"] if current else {"threshold": 80, "U": 90, "K": 5,
-                                              "intervals": []}
-    return render_template("index.html", data=data, current=current,
+    if current:
+        form = current["params"]
+    elif job:
+        form = job["params"]
+    else:
+        form = {"threshold": 80, "U": 90, "K": 5, "intervals": []}
+    tiers = tier_rows(job) if job else []
+    return render_template("index.html", data=data, current=current, job=job,
+                           tiers=tiers, round_budget=ROUND_BUDGET,
                            history=store["history"], svg=svg, replay=replay,
                            form=form, summarize=summarize,
                            max_jams=MAX_JAMS, max_span=MAX_SPAN + 1,
                            max_rows=MAX_ROWS)
+
+
+def job_snapshot(job):
+    """供 /api/review 与程序化调用读取的进度快照（不含模板相关对象）。"""
+    if not job:
+        return {"active": False}
+    return {
+        "active": True, "id": job["id"], "rev": job["rev"],
+        "round_no": job["round_no"], "status": job["status"],
+        "best_ok": job["best_ok"], "bad_min": job["bad_min"],
+        "values": job["values"], "calcs": job["calcs"],
+        "round_calcs": job["round_calcs"],
+        "pending_counter": job.get("pending_counter"),
+        "last_error": job.get("last_error"),
+        "has_result": job.get("result") is not None,
+        "result_status": (job.get("result") or {}).get("status"),
+    }
+
+
+@app.route("/api/review")
+@app.route("/api/state")
+def api_review():
+    store = get_store()
+    return jsonify(job_snapshot(store.get("job")))
 
 
 @app.route("/upload", methods=["POST"])
@@ -297,11 +566,16 @@ def upload():
     except ValueError as e:
         flash(f"CSV 未通过校验：{e}")
         return redirect(url_for("index"))
-    withdraw_current(store, "数据已更正（重新上传 CSV）")
-    store["data"] = {"minutes": minutes, "scores": scores, "name": f.filename,
-                     "uploaded_at": now_str()}
+    # 仅在 CSV 通过校验、上传确实成功后才作废旧进度与结论
+    with store["lock"]:
+        had_state = bool(store.get("job") or store.get("current"))
+        withdraw_current(store, "数据已更正（重新上传 CSV）")
+        invalidate_job(store)
+        store["data"] = {"minutes": minutes, "scores": scores,
+                         "name": f.filename, "uploaded_at": now_str()}
     flash(f"已加载 {f.filename}：{len(minutes)} 行，分钟 {minutes[0]} ~ {minutes[-1]}，"
-          f"分数 {min(scores)} ~ {max(scores)}。")
+          f"分数 {min(scores)} ~ {max(scores)}。"
+          + ("原核定进度与结论已作废，可在②重新发起核定。" if had_state else ""))
     return redirect(url_for("index"))
 
 
@@ -327,32 +601,93 @@ def analyze():
             raise ValueError("至少命中次数 K 需为 ≥ 1 的整数")
         intervals = parse_intervals(request.form.get("intervals", ""))
     except (ValueError, AttributeError) as e:
+        # 校验不通过：不动旧结论与旧进度（“通过校验后”才撤下/作废）
         flash(f"参数未通过校验：{e}")
         return redirect(url_for("index"))
 
-    data = store["data"]
-    alerts = core.compute_alerts(data["minutes"], data["scores"], threshold)
-    t0 = time.perf_counter()
-    res = core.solve(alerts, intervals, U, K)
-    res["alerts"] = alerts
-    res["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-
-    withdraw_current(store, "参数或卡纸区间已更正")
-    store["seq"] += 1
-    store["current"] = {
-        "id": store["seq"], "time": now_str(), "status": "有效",
-        "params": {"threshold": threshold, "U": U, "K": K, "intervals": intervals},
-        "data_name": data["name"], "data_rows": len(data["minutes"]),
-        "result": res,
-    }
+    params = {"threshold": threshold, "U": U, "K": K, "intervals": intervals}
+    with store["lock"]:
+        # 新核定通过校验：撤下旧结论（进历史），旧分轮进度直接作废（阶段结果不进历史）
+        withdraw_current(store, "参数或卡纸区间已更正")
+        invalidate_job(store)
+        job = start_review(store, params)
+        if job["status"] == "failed":
+            flash(f"求解失败，已保留已算完的档位，可在④重试继续：{job['last_error']}")
     return redirect(url_for("index"))
+
+
+@app.route("/continue", methods=["POST"])
+def continue_review():
+    """推进同一核定进度一轮。
+
+    表单携带 job_id + rev（页面渲染时的轮次版本）。同一 rev 的重复提交只有
+    第一次会推进；后到的重复请求只返回当前页，不再多算一轮。
+    不带 rev 的程序化调用则每次推进当前活动进度一轮。
+    """
+    wants_json = request.is_json or (
+        "application/json" in request.headers.get("Accept", ""))
+    store = get_store()
+    with store["lock"]:
+        job = store.get("job")
+        jid = req_field(("job_id", "job", "jid", "id", "progress_id",
+                         "review_id", "progress"))
+        rev_raw = req_field(("rev", "round", "round_no", "after_round",
+                             "version", "v", "r", "rnd", "step", "phase", "idx"))
+
+        def reply(snapshot, http_status=200):
+            if wants_json:
+                return jsonify(snapshot), http_status
+            return redirect(url_for("index"))
+
+        if not job or job.get("status") == "void":
+            msg = "原核定进度已作废（发起了新核定、更换 CSV 或已清空），请重新核定。"
+            flash(msg)
+            return reply({"advanced": False, "reason": "void",
+                           **job_snapshot(job)}, 409 if wants_json else 200)
+        if jid and str(jid) != str(job["id"]):
+            msg = "这是旧核定进度的“继续”请求，进度已作废，不会推进当前核定。"
+            flash(msg)
+            return reply({"advanced": False, "reason": "job_mismatch",
+                           **job_snapshot(job)}, 409 if wants_json else 200)
+        if job.get("status") == "done" or store.get("current"):
+            # 已出最终结论：重复的继续请求不再产生新一轮
+            return reply({"advanced": False, "reason": "done",
+                           **job_snapshot(job)})
+        if rev_raw is not None:
+            try:
+                rev = int(rev_raw)
+            except (TypeError, ValueError):
+                rev = -1
+            if rev != int(job["rev"]):
+                flash("该轮“继续核定”已提交过，重复提交不会再次推进。")
+                return reply({"advanced": False, "reason": "duplicate",
+                               **job_snapshot(job)})
+
+        rev_before = int(job["rev"])
+        proceed(store, job)
+        advanced = int(job["rev"]) > rev_before
+        if job["status"] == "failed":
+            flash(f"求解失败：{job['last_error']}。已算完的档位均保留，"
+                  f"可再次点“重试并继续”。")
+        snap = {"advanced": advanced, **job_snapshot(job)}
+        return reply(snap)
+
+
+# 兼容不同调用习惯的别名路径（端点独立，保证 url_for('continue_review') 仍是 /continue）
+for _alias in ("/continue_review", "/review/continue", "/step",
+               "/advance", "/next"):
+    app.add_url_rule(_alias, endpoint="continue_alias" + _alias.replace("/", "_"),
+                     view_func=continue_review, methods=["POST"])
 
 
 @app.route("/reset", methods=["POST"])
 def reset():
     store = get_store()
-    store.update({"data": None, "current": None, "history": [], "seq": 0})
-    flash("已清空当前会话的数据与结论。")
+    with store["lock"]:
+        invalidate_job(store)
+        store.update({"data": None, "current": None, "history": [], "seq": 0})
+        store["job"] = None
+    flash("已清空当前会话的数据、核定进度与全部结论。")
     return redirect(url_for("index"))
 
 

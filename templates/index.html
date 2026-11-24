@@ -17,6 +17,11 @@
   section h2 { font-size:16px; margin:0 0 10px; }
   .flash { padding:9px 12px; border-radius:6px; margin-bottom:10px; font-size:14px;
            background:#fff8e6; border:1px solid #f0d48a; }
+  .handover { padding:10px 14px; border-radius:8px; margin-bottom:14px; font-size:14px;
+              line-height:1.7; }
+  .handover.run { background:#ddf4ff; border:1px solid #54aeff; color:#0a4d8c; }
+  .handover.ok { background:#dafbe1; border:1px solid #2da44e; color:#116329; }
+  .handover .pending { font-size:13px; padding:0 8px; }
   label { font-size:14px; display:block; margin:10px 0 4px; }
   input[type=text], input[type=number], textarea { font:inherit; padding:6px 8px;
          border:1px solid var(--line); border-radius:6px; }
@@ -33,6 +38,21 @@
   .banner { padding:12px 16px; border-radius:8px; font-size:17px; font-weight:600; margin:6px 0 10px; }
   .banner.ok { background:#dafbe1; border:1px solid #2da44e; color:var(--ok); }
   .banner.bad { background:#ffebe9; border:1px solid #fa8c8c; color:var(--bad); }
+  .banner.run { background:#ddf4ff; border:1px solid #54aeff; color:#0969da; }
+  .bounds { display:flex; gap:16px; flex-wrap:wrap; margin:10px 0; }
+  .bound { flex:1 1 320px; border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+  .bound .t { font-size:13px; color:var(--mut); margin-bottom:6px; }
+  .bound .v { font-size:22px; font-weight:700; }
+  .bound.okb { background:#f6fff8; border-color:#94d8a8; }
+  .bound.okb .v { color:var(--ok); }
+  .bound.bad b, .bound.bad .v { color:var(--bad); }
+  .bound.bad { background:#fff8f7; border-color:#f3b4b4; }
+  .pending { display:inline-block; font-size:15px; font-weight:600; color:#9a6700;
+             background:#fff8c5; border:1px dashed #d4a72c; border-radius:6px; padding:2px 10px; }
+  .errbox { background:#ffebe9; border:1px solid #fa8c8c; color:var(--bad);
+            border-radius:6px; padding:9px 12px; font-size:13px; margin:8px 0; }
+  button.warn { background:#bf8700; }
+  .meta-line { font-size:12px; color:var(--mut); margin:6px 0; }
   .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
   .tag.ok { background:#dafbe1; color:var(--ok); }
   .tag.off { background:#eaeef2; color:var(--mut); }
@@ -52,6 +72,26 @@
   {% with messages = get_flashed_messages() %}
     {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
   {% endwith %}
+
+  {% if job and not current and job.status != 'void' %}
+  <div class="handover run">
+    👷 <b>班长交接：</b>该核定仍在分轮进行——当前已证实可承诺的处置时间为
+    {% if job.best_ok %}<b>L = {{ job.best_ok }} 分钟</b>
+      （最坏命中 {{ job.best_ok_hits }} 次 ≥ K={{ job.K }}）{% else %}<span class="pending">待核定</span>{% endif %}；
+    不能承诺的最小档为
+    {% if job.bad_min %}<b>L = {{ job.bad_min }} 分钟</b>
+      （最坏仅 {{ job.bad_min_hits }} 次）{% else %}<span class="pending">待核定</span>{% endif %}。
+    已完成 {{ job.round_no }} 轮，可<a href="#progress-panel" style="font-weight:700">到④接着核定 ↓</a>
+  </div>
+  {% elif current %}
+  <div class="handover ok">
+    👷 <b>班长交接：</b>当前有有效核定结论——
+    {% set r0 = current.result %}
+    {% if r0.status == 'ok' %}已证实可承诺处置时间 <b>L = {{ r0.L }} 分钟</b>（保证至少命中 {{ r0.min_hits }} 次 ≥ K={{ r0.K }}）。
+    {% else %}<b style="color:var(--bad)">无法承诺任何档位</b>（L=1 反例仅命中 {{ r0.counter.hits }} 次 &lt; K={{ r0.K }}）。{% endif %}
+    <a href="#conclusion" style="font-weight:700">查看④核定结论 ↓</a>
+  </div>
+  {% endif %}
 
   <section>
     <h2>① 上传逐分钟模型分数 CSV</h2>
@@ -73,7 +113,7 @@
     <form method="post" action="{{ url_for('analyze') }}">
       <div class="row">
         <div><label>告警阈值（分数 ≥ 阈值即达标）</label>
-          <input type="text" name="threshold" value="{{ form.threshold }}" required></div>
+          <input type="text" name="threshold" value="{{ '%g'|format(form.threshold|float) }}" required></div>
         <div><label>有效提前量上限 U（分钟）</label>
           <input type="number" name="U" min="1" value="{{ form.U }}" required></div>
         <div><label>至少命中次数 K</label>
@@ -99,11 +139,91 @@
   </section>
   {% endif %}
 
+  {% if job and not current and job.status != 'void' %}
+  <section id="progress-panel" data-job-id="{{ job.id }}" data-rev="{{ job.rev }}"
+           data-status="{{ job.status }}" data-round="{{ job.round_no }}"
+           data-calcs="{{ job.calcs }}"
+           data-best-ok="{{ job.best_ok if job.best_ok is not none else '' }}"
+           data-bad-min="{{ job.bad_min if job.bad_min is not none else '' }}">
+    <h2>④ 分轮核定进度
+      {% if job.status == 'failed' %}<span class="tag off" style="background:#ffebe9;color:#cf222e">求解失败 · 已保留已算档位</span>
+      {% else %}<span class="tag off">核定中 · 第 {{ job.round_no }} 轮已完成</span>{% endif %}
+      <span style="font-weight:400;font-size:12px;color:#6a737d">#{{ job.seq }} · {{ job.updated_at }} · 数据 {{ job.data_name }} · 阈值 {{ '%g'|format(job.threshold|float) }} · U={{ job.U }} · K={{ job.K }}</span>
+    </h2>
+
+    <div class="bounds">
+      <div class="bound okb">
+        <div class="t">已证实可承诺的最大档 · 班长交接可先看这个“已证实的处置时间”（任意时刻组合均命中 ≥ K）</div>
+        <div class="v">
+          {% if job.best_ok %}L = {{ job.best_ok }} 分钟
+            <span style="font-size:13px;font-weight:400;color:#1a7f37">
+              该档最坏命中 {{ job.best_ok_hits }} 次 ≥ K={{ job.K }}</span>
+          {% else %}<span class="pending">待核定</span>{% endif %}
+        </div>
+      </div>
+      <div class="bound bad">
+        <div class="t">不能承诺的最小档（已找到命中 &lt; K 的组合）</div>
+        <div class="v">
+          {% if job.bad_min %}L = {{ job.bad_min }} 分钟
+            <span style="font-size:13px;font-weight:400;color:#cf222e">
+              该档最坏仅命中 {{ job.bad_min_hits }} 次 &lt; K={{ job.K }}</span>
+          {% else %}<span class="pending">待核定</span>{% endif %}
+        </div>
+      </div>
+    </div>
+
+    {% if job.status == 'failed' %}
+      <div class="errbox"><b>求解失败：</b>{{ job.last_error }}<br>
+        此前已算完的档位没有丢失（见下表），点下方按钮可从断点重试，已算档位不会重算。</div>
+    {% endif %}
+
+    {% if job.pending_counter %}
+      <div class="banner run" style="font-size:14px">搜索边界已收口：下一轮只需对
+        <b>L={{ job.pending_counter }}</b> 档做 1 次反例求解，给出反例时刻与最佳配对。</div>
+    {% endif %}
+
+    <p class="meta-line">
+      同一次核定沿用提交时的阈值/区间/告警；每提交或继续一次，最多做 {{ round_budget }} 次
+      “单档最坏命中计算”（构造反例所需的求解也计入）。本次进度已完成
+      <b>{{ job.round_no }}</b> 轮、累计 <b>{{ job.calcs }}</b> 次计算
+      （上一轮 {{ job.round_calcs }} 次，累计计算耗时 {{ '%.0f'|format(job.calc_ms) }}ms）。
+      阶段结果只是进度，不会进入“历史结论”。
+    </p>
+
+    {% if tiers %}
+    <table>
+      <tr><th>已核定档位 L</th><th>最坏命中数</th><th>判定（K={{ job.K }}）</th></tr>
+      {% for t in tiers|reverse %}
+      <tr>
+        <td>L={{ t.L }}</td><td>{{ t.hits }}</td>
+        <td>{% if t.verdict == '可承诺' %}<span class="tag ok">可承诺</span>
+            {% else %}<span class="tag off" style="background:#ffebe9;color:#cf222e">不能承诺</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('continue_review') }}" id="continue-form">
+      <input type="hidden" name="job_id" value="{{ job.id }}">
+      <input type="hidden" name="rev" value="{{ job.rev }}">
+      <p>
+        <button type="submit" id="continue-btn"
+          class="{% if job.status == 'failed' %}warn{% endif %}">
+          {% if job.status == 'failed' %}重试并继续核定{% else %}继续核定（最多再算 {{ round_budget }} 档）{% endif %}
+        </button>
+        <span class="hint" style="display:inline-block;margin-left:10px">
+          重复提交同一份“继续”表单最多推进一轮；也可修改②参数后重新提交，旧进度立即作废。
+        </span>
+      </p>
+    </form>
+  </section>
+  {% endif %}
+
   {% if current %}
   {% set r = current.result %}
-  <section>
+  <section id="conclusion">
     <h2>④ 核定结论 <span class="tag ok">当前有效</span>
-      <span style="font-weight:400;font-size:12px;color:#6a737d">#{{ current.id }} · {{ current.time }} · 数据 {{ current.data_name }} · 阈值 {{ current.params.threshold }} · U={{ current.params.U }} · K={{ current.params.K }} · 耗时 {{ r.elapsed_ms }}ms</span></h2>
+      <span style="font-weight:400;font-size:12px;color:#6a737d">#{{ current.id }} · {{ current.time }} · 数据 {{ current.data_name }} · 阈值 {{ '%g'|format(current.params.threshold|float) }} · U={{ current.params.U }} · K={{ current.params.K }} · 分 {{ r.rounds }} 轮 · {{ r.calcs }} 次计算 · 计算耗时 {{ r.elapsed_ms }}ms</span></h2>
 
     {% if r.status == 'ok' %}
       <div class="banner ok">可承诺：L = {{ r.L }} 分钟（1≤L≤U={{ r.U }} 范围内的最大值）。任意卡纸时刻组合至少命中 {{ r.min_hits }} 次 ≥ K={{ r.K }}。</div>
@@ -133,6 +253,16 @@
     {% endif %}
 
     <details>
+      <summary>分轮核定记录：共 {{ r.rounds }} 轮、{{ r.calcs }} 次单档最坏命中计算（各档最坏命中只算一次，反例求解计入）</summary>
+      <table>
+        <tr><th>档位 L</th><th>最坏命中数</th><th>判定（K={{ r.K }}）</th></tr>
+        {% for t in r.tiers|reverse %}
+        <tr><td>L={{ t.L }}</td><td>{{ t.hits }}</td><td>{{ t.verdict }}</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+
+    <details>
       <summary>本档参数下共 {{ r.n_alerts }} 条告警（每段连续达标只计首分钟）</summary>
       <p style="font-family:ui-monospace,Consolas,monospace">{{ r.alerts | join(', ') }}</p>
     </details>
@@ -148,7 +278,7 @@
       <tr>
         <td>{{ e.id }}</td><td>{{ e.time }}</td>
         <td>{{ e.data_name }}（{{ e.data_rows }}行）</td>
-        <td>阈值{{ e.params.threshold }} U={{ e.params.U }} K={{ e.params.K }} 区间{{ e.params.intervals|length }}段</td>
+        <td>阈值{{ '%g'|format(e.params.threshold|float) }} U={{ e.params.U }} K={{ e.params.K }} 区间{{ e.params.intervals|length }}段</td>
         <td>{{ summarize(e) }}</td>
         <td><span class="tag off">已撤下</span><br><span style="font-size:11px;color:#6a737d">{{ e.withdraw_reason }}</span></td>
       </tr>

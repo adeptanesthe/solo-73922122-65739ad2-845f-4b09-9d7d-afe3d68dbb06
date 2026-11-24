@@ -113,6 +113,26 @@ def counterexample(L, alerts, intervals, U):
     return combo, pairs
 
 
+def format_counter(Lc, combo, pairs, intervals):
+    """把反例组合/最佳配对整理成页面与 solve 共用的字典结构。"""
+    m = len(intervals)
+    by_jam = {p[0]: p for p in pairs}
+    rows = []
+    for i, (a, b) in enumerate(intervals):
+        p = by_jam.get(i)
+        rows.append({"jam": i, "a": a, "b": b, "t": combo[i],
+                     "alert": p[2] if p else None,
+                     "lead": p[3] if p else None})
+    return {
+        "L": Lc,
+        "combo": list(combo),
+        "pairs": [tuple(p) for p in pairs],
+        "rows": rows,
+        "hits": len(pairs),
+        "unmatched": [i for i in range(m) if i not in by_jam],
+    }
+
+
 def solve(alerts, intervals, U, K):
     """主求解：返回结论字典。
 
@@ -129,21 +149,7 @@ def solve(alerts, intervals, U, K):
 
     def make_counter(Lc):
         combo, pairs = counterexample(Lc, alerts, intervals, U)
-        by_jam = {p[0]: p for p in pairs}
-        rows = []
-        for i, (a, b) in enumerate(intervals):
-            p = by_jam.get(i)
-            rows.append({"jam": i, "a": a, "b": b, "t": combo[i],
-                         "alert": p[2] if p else None,
-                         "lead": p[3] if p else None})
-        return {
-            "L": Lc,
-            "combo": list(combo),
-            "pairs": pairs,
-            "rows": rows,
-            "hits": len(pairs),
-            "unmatched": [i for i in range(m) if i not in by_jam],
-        }
+        return format_counter(Lc, combo, pairs, intervals)
 
     if not alerts:
         out.update(status="infeasible", reason="no_alerts", counter=make_counter(1))
